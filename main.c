@@ -2,138 +2,220 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <dirent.h>
+#include <errno.h>
+#include <time.h>
+#include <ctype.h>
 
 #define PORT 9100
-static char body[16384];
-static char header[512];
+#define METRICS_FILE "/dev/shm/mag_metrics.prom"
+#define TEMP_FILE "/dev/shm/mag_metrics.tmp"
 
-void collect_metrics(char* b, size_t max) {
-    int off = 0;
-    char line[512];
-    FILE* f;
+static char buffer[16384];
+static char tmp_line[1024];
 
-    // 1. Load Average
-    f = fopen("/proc/loadavg", "r");
-    if (f) {
+const char* target_names[] = {
+    "MAG250_ControlT", "AUD[0].PESTask", "AUD[0].DecTask", "AUD[0].MixTask", 
+    "STVID[0].H264Pa", "STVID[0].Produc", "STVID[0].Displa", NULL
+};
+
+
+void fast_read(const char* path, char* dest, size_t max) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { dest[0] = 0; return; }
+    int n = read(fd, dest, max - 1);
+    if (n > 0) dest[n] = 0; else dest[0] = 0;
+    close(fd);
+}
+
+void collector_loop() {
+    while (1) {
+        int fd = open(TEMP_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { sleep(5); continue; }
+
+        int len = 0;
+
+        // 1. Time & Uptime
+        fast_read("/proc/uptime", tmp_line, sizeof(tmp_line));
+        double up; if(sscanf(tmp_line, "%lf", &up)) 
+            len += snprintf(buffer+len, sizeof(buffer)-len, "node_uptime_seconds %.2f\n", up);
+        
+        len += snprintf(buffer+len, sizeof(buffer)-len, "mag_exporter_last_update_timestamp %ld\n", time(NULL));
+
+        // 2. Load Average
+        fast_read("/proc/loadavg", tmp_line, sizeof(tmp_line));
         double l1, l5, l15;
-        if (fscanf(f, "%lf %lf %lf", &l1, &l5, &l15) == 3) {
-            off += snprintf(b + off, max - off, "node_load1 %.2f\nnode_load5 %.2f\nnode_load15 %.2f\n", l1, l5, l15);
-        }
-        fclose(f);
-    }
+        if (sscanf(tmp_line, "%lf %lf %lf", &l1, &l5, &l15) == 3)
+            len += snprintf(buffer+len, sizeof(buffer)-len, "node_load1 %.2f\nnode_load5 %.2f\nnode_load15 %.2f\n", l1, l5, l15);
 
-    // 2. Global CPU Stats (из /proc/stat)
-    f = fopen("/proc/stat", "r");
-    if (f) {
-        unsigned long long u, n, s, i, iw, irq, sirq;
-        if (fgets(line, sizeof(line), f)) {
-            if (sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &s, &i, &iw, &irq, &sirq) >= 4) {
-                off += snprintf(b + off, max - off, 
-                    "node_cpu_seconds_total{mode=\"user\"} %.2f\n"
-                    "node_cpu_seconds_total{mode=\"system\"} %.2f\n"
-                    "node_cpu_seconds_total{mode=\"idle\"} %.2f\n"
-                    "node_cpu_seconds_total{mode=\"iowait\"} %.2f\n"
-                    "node_cpu_seconds_total{mode=\"irq\"} %.2f\n",
-                    (double)u/100.0, (double)s/100.0, (double)i/100.0, (double)iw/100.0, (double)irq/100.0);
-            }
+        // 3. Network
+        fast_read("/proc/net/dev", tmp_line, sizeof(tmp_line));
+        char net_buf[4096];
+        fast_read("/proc/net/dev", net_buf, sizeof(net_buf));
+        char* p = strstr(net_buf, "eth0:");
+        if (p) {
+            unsigned long long rx, tx;
+            sscanf(p + 5, "%llu %*u %*u %*u %*u %*u %*u %*u %llu", &rx, &tx);
+            len += snprintf(buffer+len, sizeof(buffer)-len, "node_network_receive_bytes_total %llu\nnode_network_transmit_bytes_total %llu\n", rx, tx);
         }
-        while(fgets(line, sizeof(line), f)) {
-            unsigned long long val;
-            if (sscanf(line, "ctxt %llu", &val)) off += snprintf(b + off, max - off, "node_context_switches_total %llu\n", val);
-            if (sscanf(line, "intr %llu", &val)) off += snprintf(b + off, max - off, "node_intr_total %llu\n", val);
-        }
-        fclose(f);
-    }
 
-    // 3. Memory Stats (из /proc/meminfo)
-    f = fopen("/proc/meminfo", "r");
-    if (f) {
-        unsigned long val;
-        while (fgets(line, sizeof(line), f)) {
-            if (sscanf(line, "MemTotal: %lu", &val)) off += snprintf(b + off, max - off, "node_memory_MemTotal_bytes %lu\n", val * 1024);
-            if (sscanf(line, "MemFree: %lu", &val)) off += snprintf(b + off, max - off, "node_memory_MemFree_bytes %lu\n", val * 1024);
-            if (sscanf(line, "Buffers: %lu", &val)) off += snprintf(b + off, max - off, "node_memory_Buffers_bytes %lu\n", val * 1024);
-            if (sscanf(line, "Cached: %lu", &val)) off += snprintf(b + off, max - off, "node_memory_Cached_bytes %lu\n", val * 1024);
-        }
-        fclose(f);
-    }
-
-    // 4. Uptime
-    f = fopen("/proc/uptime", "r");
-    if (f) {
-        double up;
-        if (fscanf(f, "%lf", &up) == 1) off += snprintf(b + off, max - off, "node_uptime_seconds %.2f\n", up);
-        fclose(f);
-    }
-
-    // 5. Network (eth0)
-    f = fopen("/proc/net/dev", "r");
-    if (f) {
-        while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, "eth0:")) {
-                char *p = strchr(line, ':') + 1;
-                unsigned long long rx, tx, rx_p, tx_p, rx_err, tx_err;
-                // Парсим: bytes, packets, errs...
-                if (sscanf(p, "%llu %llu %llu %*u %*u %*u %*u %*u %llu %llu %llu", &rx, &rx_p, &rx_err, &tx, &tx_p, &tx_err) >= 4) {
-                    off += snprintf(b + off, max - off, 
-                        "node_network_receive_bytes_total %llu\n"
-                        "node_network_receive_packets_total %llu\n"
-                        "node_network_receive_errors_total %llu\n"
-                        "node_network_transmit_bytes_total %llu\n"
-                        "node_network_transmit_packets_total %llu\n", rx, rx_p, rx_err, tx, tx_p);
-                }
-            }
-        }
-        fclose(f);
-    }
-
-    // 6. UDP Multicast
-    f = fopen("/proc/net/udp", "r");
-    if (f) {
+        // 4. UDP Streams
+        char udp_buf[8192];
+        fast_read("/proc/net/udp", udp_buf, sizeof(udp_buf));
         int udp_cnt = 0;
-        while (fgets(line, sizeof(line), f)) {
-            unsigned int addr;
-            if (sscanf(line, "%*d: %x:", &addr) == 1) {
+        p = udp_buf;
+        while ((p = strchr(p, '\n')) != NULL) {
+            p++; unsigned int addr;
+            if (sscanf(p, "%*d: %x:", &addr) == 1) {
                 if ((unsigned char)(addr & 0xFF) >= 0xE0) udp_cnt++;
             }
         }
-        off += snprintf(b + off, max - off, "mag250_udp_streams_total %d\n", udp_cnt);
-        fclose(f);
+        len += snprintf(buffer+len, sizeof(buffer)-len, "mag250_udp_streams_total %d\n", udp_cnt);
+
+        // 5. PROCESSES
+        DIR* dir = opendir("/proc");
+        if (dir) {
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != NULL) {
+                if (isdigit(ent->d_name[0])) {
+                    int pid = atoi(ent->d_name);
+                    
+                    char path[64];
+                    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+                    char cmd[256];
+                    fast_read(path, cmd, sizeof(cmd));
+                    
+                    char* proc_name = NULL;
+                    
+                    for (int i = 0; target_names[i]; i++) {
+                        if (strstr(cmd, target_names[i])) {
+                            proc_name = (char*)target_names[i];
+                            break;
+                        }
+                    }
+
+                    if (!proc_name) {
+                        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+                        int sfd = open(path, O_RDONLY | O_NONBLOCK); // Попытка неблокирующего открытия
+                        if (sfd >= 0) {
+                            char stat_buf[512];
+                            int n = read(sfd, stat_buf, sizeof(stat_buf)-1);
+                            close(sfd);
+                            if (n > 0) {
+                                stat_buf[n] = 0;
+                                char* op = strchr(stat_buf, '(');
+                                char* cp = strrchr(stat_buf, ')');
+                                if (op && cp) {
+                                    *cp = 0;
+                                    char* comm = op + 1;
+                                    for (int i = 0; target_names[i]; i++) {
+                                        if (strcmp(comm, target_names[i]) == 0) {
+                                            proc_name = (char*)target_names[i];
+                                            char state; unsigned long ut, st;
+                                            if (sscanf(cp + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &state, &ut, &st) >= 3) {
+                                                 len += snprintf(buffer+len, sizeof(buffer)-len, 
+                                                    "mag250_process_cpu_ticks{name=\"%s\",mode=\"user\"} %lu\n"
+                                                    "mag250_process_cpu_ticks{name=\"%s\",mode=\"system\"} %lu\n"
+                                                    "mag250_process_blocked{name=\"%s\"} %d\n", 
+                                                    proc_name, ut, proc_name, st, proc_name, (state == 'D'));
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // всё равно надо читать stat для CPU
+                        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+                        fast_read(path, tmp_line, sizeof(tmp_line));
+                        char* cp = strrchr(tmp_line, ')');
+                        if (cp) {
+                             char state; unsigned long ut, st;
+                             sscanf(cp + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &state, &ut, &st);
+                             len += snprintf(buffer+len, sizeof(buffer)-len, 
+                                "mag250_process_cpu_ticks{name=\"%s\",mode=\"user\"} %lu\n"
+                                "mag250_process_cpu_ticks{name=\"%s\",mode=\"system\"} %lu\n"
+                                "mag250_process_blocked{name=\"%s\"} %d\n", 
+                                proc_name, ut, proc_name, st, proc_name, (state == 'D'));
+                        }
+                    }
+                }
+            }
+            closedir(dir);
+        }
+
+        write(fd, buffer, len);
+        close(fd);
+        rename(TEMP_FILE, METRICS_FILE);
+        
+        sleep(5);
     }
 }
 
+
 int main() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        collector_loop();
+        exit(0);
+    }
+    
+    if (pid < 0) {
+        perror("Fork failed");
+        return 1;
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(PORT);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 1;
-    listen(fd, 2);
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 1;
+    listen(server_fd, 10);
 
-    printf("Rich Metrics Exporter started on port %d\n", PORT);
+    printf("Split-Architecture Exporter started on port %d. PID: %d, Collector PID: %d\n", PORT, getpid(), pid);
 
     while (1) {
-        int client = accept(fd, NULL, NULL);
+        int client = accept(server_fd, NULL, NULL);
         if (client < 0) continue;
 
-        char req[512]; read(client, req, sizeof(req));
-        
-        memset(body, 0, sizeof(body));
-        collect_metrics(body, sizeof(body));
+        char garbage[512];
+        read(client, garbage, sizeof(garbage));
 
+        int fd = open(METRICS_FILE, O_RDONLY);
+        int len = 0;
+        if (fd >= 0) {
+            len = read(fd, buffer, sizeof(buffer) - 1);
+            close(fd);
+        } else {
+            len = sprintf(buffer, "# Metrics gathering...\n");
+        }
+        if (len < 0) len = 0;
+        buffer[len] = 0;
+
+        char header[256];
         int hlen = snprintf(header, sizeof(header), 
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", 
-            strlen(body));
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", 
+            len);
 
         write(client, header, hlen);
-        write(client, body, strlen(body));
+        write(client, buffer, len);
+        
+        shutdown(client, SHUT_RDWR);
         close(client);
     }
     return 0;
