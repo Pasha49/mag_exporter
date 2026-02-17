@@ -16,7 +16,7 @@
 #define PORT 9100
 #define METRICS_FILE "/dev/shm/mag_metrics.prom"
 #define TEMP_FILE "/dev/shm/mag_metrics.tmp"
-#define EXPORTER_VERSION "1.11"
+#define EXPORTER_VERSION "1.13"
 
 static char buffer[32768]; 
 static char big_read_buf[4096]; 
@@ -34,7 +34,6 @@ TargetProcess targets[] = {
     {"STVID[0].H264Pa", -1},
     {"STVID[0].Produc", -1},
     {"STVID[0].Displa", -1},
-    {"stbapp", -1}, 
     {NULL, -1}
 };
 
@@ -96,7 +95,6 @@ void refresh_pids_if_needed() {
     closedir(dir);
 }
 
-// Помощник для сборки строки
 int append_metric(int len, int max_len, const char* format, ...) {
     if (max_len - len < 512) return len;
     va_list args;
@@ -108,7 +106,6 @@ int append_metric(int len, int max_len, const char* format, ...) {
 }
 
 void collector_loop() {
-    // 1 рфз сбор статических данных (чтобы не грузить CPU)
     char fw_desc[128] = "unknown";
     char mac_addr[32] = "unknown";
     
@@ -116,11 +113,8 @@ void collector_loop() {
     if (fp) {
         char line[256];
         while (fgets(line, sizeof(line), fp)) {
-            if (strncmp(line, "Image_Desc=", 11) == 0) {
-                sscanf(line+11, "%127[^\n]", fw_desc);
-            } else if (strncmp(line, "ethaddr=", 8) == 0) {
-                sscanf(line+8, "%31[^\n]", mac_addr);
-            }
+            if (strncmp(line, "Image_Desc=", 11) == 0) sscanf(line+11, "%127[^\n]", fw_desc);
+            else if (strncmp(line, "ethaddr=", 8) == 0) sscanf(line+8, "%31[^\n]", mac_addr);
         }
         pclose(fp);
     }
@@ -134,25 +128,21 @@ void collector_loop() {
         int len = 0;
         int max_len = sizeof(buffer);
 
-        // INFO vtnhbrf
         len = append_metric(len, max_len, 
             "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\"} 1\n", 
             EXPORTER_VERSION, fw_desc, mac_addr);
 
-        // Uptime and Time
         if (read_file_to_buf("/proc/uptime", big_read_buf, sizeof(big_read_buf))) {
             double up; if(sscanf(big_read_buf, "%lf", &up)) len = append_metric(len, max_len, "node_uptime_seconds %.2f\n", up);
         }
-        len = append_metric(len, max_len, "mag_exporter_last_update_timestamp %ld\n", time(NULL));
+        len = append_metric(len, max_len, "mag_exporter_last_update_timestamp %llu\n", (unsigned long long)time(NULL));
 
-        // Load Average
         if (read_file_to_buf("/proc/loadavg", big_read_buf, sizeof(big_read_buf))) {
             double l1, l5, l15;
             if (sscanf(big_read_buf, "%lf %lf %lf", &l1, &l5, &l15) == 3)
                 len = append_metric(len, max_len, "node_load1 %.2f\nnode_load5 %.2f\nnode_load15 %.2f\n", l1, l5, l15);
         }
 
-        // CPU Stats
         if (read_file_to_buf("/proc/stat", big_read_buf, sizeof(big_read_buf))) {
             unsigned long long u, n, s, i, iw;
             char* p = strstr(big_read_buf, "cpu ");
@@ -164,7 +154,6 @@ void collector_loop() {
             }
         }
 
-        // Memory Stats
         if (read_file_to_buf("/proc/meminfo", big_read_buf, sizeof(big_read_buf))) {
             unsigned long mt=0, mf=0, mb=0, mc=0;
             char* p = strstr(big_read_buf, "MemTotal:"); if(p) sscanf(p, "MemTotal: %lu", &mt);
@@ -177,7 +166,6 @@ void collector_loop() {
                 mt*1024, mf*1024, mb*1024, mc*1024);
         }
 
-        // Network (eth0)
         if (read_file_to_buf("/proc/net/dev", big_read_buf, sizeof(big_read_buf))) {
             char* p = strstr(big_read_buf, "eth0:");
             if (p) {
@@ -191,7 +179,6 @@ void collector_loop() {
             }
         }
 
-        // UDP Multicast
         if (read_file_to_buf("/proc/net/udp", big_read_buf, sizeof(big_read_buf))) {
             int udp_cnt = 0;
             char* p = big_read_buf;
@@ -202,10 +189,9 @@ void collector_loop() {
             len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
         }
 
-        // Process Stats
         int stbapp_pid = -1;
         for (int i = 0; targets[i].name; i++) {
-            if (strcmp(targets[i].name, "stbapp") == 0) stbapp_pid = targets[i].pid;
+            if (strcmp(targets[i].name, "MAG250_ControlT") == 0) stbapp_pid = targets[i].pid;
             
             if (targets[i].pid != -1) {
                 char path[64];
@@ -232,8 +218,7 @@ void collector_loop() {
             }
         }
 
-        int hw_vid = 0;
-        int hw_aud = 0;
+        int hw_vid = 0, hw_aud = 0;
         if (stbapp_pid != -1) {
             char fd_dir_path[64];
             snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", stbapp_pid);
@@ -244,7 +229,6 @@ void collector_loop() {
                     if (isdigit(fd_ent->d_name[0])) {
                         char fd_path[128], link_target[256];
                         snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir_path, fd_ent->d_name);
-                        // readlink работает с VFS, это безопасно и не блокирует ядро
                         int r = readlink(fd_path, link_target, sizeof(link_target)-1);
                         if (r > 0) {
                             link_target[r] = '\0';
@@ -268,16 +252,17 @@ void collector_loop() {
 }
 
 
-int main() {
+pid_t spawn_collector() {
     pid_t pid = fork();
     if (pid == 0) {
         collector_loop();
         exit(0);
     }
-    if (pid < 0) return 1;
+    return pid;
+}
 
+int main() {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN); 
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -288,16 +273,47 @@ int main() {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 1;
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("Bind failed");
+        return 1;
+    }
     listen(server_fd, 10);
 
-    while (1) {
-        int client = accept(server_fd, NULL, NULL);
-        if (client < 0) continue;
+    // Запускаем сборщик в первый раз
+    pid_t collector_pid = spawn_collector();
 
-        struct timeval tv = {2, 0};
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+    printf("Watchdog Exporter v%s started. Port: %d, Collector PID: %d\n", EXPORTER_VERSION, PORT, collector_pid);
+    fflush(stdout);
+
+    while (1) {
+        int status;
+        if (waitpid(collector_pid, &status, WNOHANG) != 0) {
+            // Если сборщик умер (например, убит системой при нехватке памяти)
+            printf("[WARNING] Collector died! Respawning...\n"); fflush(stdout);
+            collector_pid = spawn_collector();
+        }
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(server_fd, &fds);
+        struct timeval tv = {2, 0}; // Просыпаемся каждые 2 секунды для проверки Watchdog
+
+        int sel = select(server_fd + 1, &fds, NULL, NULL, &tv);
+        if (sel <= 0) {
+            // если никто не подключился за 2 сек, или ошибка - просто идем на новый круг цикла
+            continue; 
+        }
+
+        int client = accept(server_fd, NULL, NULL);
+        if (client < 0) {
+            // если не хватает файловых дескрипторов, спим 50мс и идем дальше.
+            usleep(50000); 
+            continue;
+        }
+
+        struct timeval net_tv = {2, 0};
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&net_tv, sizeof(net_tv));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&net_tv, sizeof(net_tv));
 
         char garbage[512];
         if (read(client, garbage, sizeof(garbage)) <= 0) {
