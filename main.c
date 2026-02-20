@@ -16,10 +16,12 @@
 #define PORT 9100
 #define METRICS_FILE "/dev/shm/mag_metrics.prom"
 #define TEMP_FILE "/dev/shm/mag_metrics.tmp"
-#define EXPORTER_VERSION "1.13"
+#define DEBUG_FILE "/dev/shm/mag_debug.txt"
+#define EXPORTER_VERSION "1.16"
 
 static char buffer[32768]; 
 static char big_read_buf[4096]; 
+time_t expire_time = 0; 
 
 typedef struct {
     const char* name;
@@ -37,6 +39,16 @@ TargetProcess targets[] = {
     {NULL, -1}
 };
 
+void set_state(const char* state_msg) {
+    int fd = open(DEBUG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char buf[512];
+        int len = snprintf(buf, sizeof(buf), "State: %s\nTimestamp: %ld\n", state_msg, time(NULL));
+        write(fd, buf, len);
+        close(fd);
+    }
+}
+
 int read_file_to_buf(const char* path, char* dest, size_t max) {
     int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) { dest[0] = 0; return 0; }
@@ -47,10 +59,20 @@ int read_file_to_buf(const char* path, char* dest, size_t max) {
     return 0;
 }
 
+int append_metric(int len, int max_len, const char* format, ...) {
+    if (max_len - len < 512) return len;
+    va_list args;
+    va_start(args, format);
+    int added = vsnprintf(buffer + len, max_len - len, format, args);
+    va_end(args);
+    if (added > 0 && added < max_len - len) return len + added;
+    return len;
+}
+
 time_t last_scan_time = 0;
 void refresh_pids_if_needed() {
     time_t now = time(NULL);
-    if (now - last_scan_time < 60) return; 
+    if (now - last_scan_time < 60 && now >= last_scan_time) return; 
 
     int missing = 0;
     for (int i = 0; targets[i].name; i++) {
@@ -58,6 +80,7 @@ void refresh_pids_if_needed() {
     }
     if (!missing) return;
 
+    set_state("Scanning /proc for missing PIDs");
     last_scan_time = now;
     DIR* dir = opendir("/proc");
     if (!dir) return;
@@ -71,12 +94,9 @@ void refresh_pids_if_needed() {
             snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
             if (read_file_to_buf(path, cmd, sizeof(cmd))) {
                 for (int i = 0; targets[i].name; i++) {
-                    if (targets[i].pid == -1 && strstr(cmd, targets[i].name)) {
-                        targets[i].pid = pid;
-                    }
+                    if (targets[i].pid == -1 && strstr(cmd, targets[i].name)) targets[i].pid = pid;
                 }
             }
-            
             snprintf(path, sizeof(path), "/proc/%d/stat", pid);
             if (read_file_to_buf(path, cmd, sizeof(cmd))) {
                 char* op = strchr(cmd, '(');
@@ -84,9 +104,7 @@ void refresh_pids_if_needed() {
                 if (op && cp) {
                     *cp = 0;
                     for (int i = 0; targets[i].name; i++) {
-                        if (targets[i].pid == -1 && strcmp(op + 1, targets[i].name) == 0) {
-                            targets[i].pid = pid;
-                        }
+                        if (targets[i].pid == -1 && strcmp(op + 1, targets[i].name) == 0) targets[i].pid = pid;
                     }
                 }
             }
@@ -95,20 +113,10 @@ void refresh_pids_if_needed() {
     closedir(dir);
 }
 
-int append_metric(int len, int max_len, const char* format, ...) {
-    if (max_len - len < 512) return len;
-    va_list args;
-    va_start(args, format);
-    int added = vsnprintf(buffer + len, max_len - len, format, args);
-    va_end(args);
-    if (added > 0 && added < max_len - len) return len + added;
-    return len;
-}
-
 void collector_loop() {
+    set_state("Initializing and reading fw_printenv");
     char fw_desc[128] = "unknown";
     char mac_addr[32] = "unknown";
-    
     FILE *fp = popen("fw_printenv 2>/dev/null", "r");
     if (fp) {
         char line[256];
@@ -123,15 +131,18 @@ void collector_loop() {
         refresh_pids_if_needed();
 
         int fd = open(TEMP_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) { sleep(5); continue; }
+        if (fd < 0) { 
+            // NTP-proof sleep (через select)
+            struct timeval slp = {5, 0}; select(0, NULL, NULL, NULL, &slp); 
+            continue; 
+        }
 
         int len = 0;
         int max_len = sizeof(buffer);
 
-        len = append_metric(len, max_len, 
-            "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\"} 1\n", 
-            EXPORTER_VERSION, fw_desc, mac_addr);
+        len = append_metric(len, max_len, "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\"} 1\n", EXPORTER_VERSION, fw_desc, mac_addr);
 
+        set_state("Reading LoadAvg & Uptime");
         if (read_file_to_buf("/proc/uptime", big_read_buf, sizeof(big_read_buf))) {
             double up; if(sscanf(big_read_buf, "%lf", &up)) len = append_metric(len, max_len, "node_uptime_seconds %.2f\n", up);
         }
@@ -143,6 +154,7 @@ void collector_loop() {
                 len = append_metric(len, max_len, "node_load1 %.2f\nnode_load5 %.2f\nnode_load15 %.2f\n", l1, l5, l15);
         }
 
+        set_state("Reading CPU & RAM");
         if (read_file_to_buf("/proc/stat", big_read_buf, sizeof(big_read_buf))) {
             unsigned long long u, n, s, i, iw;
             char* p = strstr(big_read_buf, "cpu ");
@@ -162,23 +174,22 @@ void collector_loop() {
             p = strstr(big_read_buf, "Cached:"); if(p) sscanf(p, "Cached: %lu", &mc);
             len = append_metric(len, max_len, 
                 "node_memory_MemTotal_bytes %lu\nnode_memory_MemFree_bytes %lu\n"
-                "node_memory_Buffers_bytes %lu\nnode_memory_Cached_bytes %lu\n", 
-                mt*1024, mf*1024, mb*1024, mc*1024);
+                "node_memory_Buffers_bytes %lu\nnode_memory_Cached_bytes %lu\n", mt*1024, mf*1024, mb*1024, mc*1024);
         }
 
+        set_state("Reading Network");
         if (read_file_to_buf("/proc/net/dev", big_read_buf, sizeof(big_read_buf))) {
             char* p = strstr(big_read_buf, "eth0:");
             if (p) {
                 unsigned long long rx, rx_err, tx;
                 if (sscanf(p + 5, "%llu %*u %llu %*u %*u %*u %*u %*u %llu", &rx, &rx_err, &tx) >= 3) {
                     len = append_metric(len, max_len, 
-                        "node_network_receive_bytes_total %llu\n"
-                        "node_network_receive_errors_total %llu\n"
-                        "node_network_transmit_bytes_total %llu\n", rx, rx_err, tx);
+                        "node_network_receive_bytes_total %llu\nnode_network_receive_errors_total %llu\nnode_network_transmit_bytes_total %llu\n", rx, rx_err, tx);
                 }
             }
         }
 
+        set_state("Reading UDP");
         if (read_file_to_buf("/proc/net/udp", big_read_buf, sizeof(big_read_buf))) {
             int udp_cnt = 0;
             char* p = big_read_buf;
@@ -189,6 +200,7 @@ void collector_loop() {
             len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
         }
 
+        set_state("Reading Process Stats");
         int stbapp_pid = -1;
         for (int i = 0; targets[i].name; i++) {
             if (strcmp(targets[i].name, "MAG250_ControlT") == 0) stbapp_pid = targets[i].pid;
@@ -213,11 +225,10 @@ void collector_loop() {
                     targets[i].pid = -1; 
                 }
             }
-            if (targets[i].pid == -1) {
-                len = append_metric(len, max_len, "mag250_process_blocked{name=\"%s\"} 0\n", targets[i].name);
-            }
+            if (targets[i].pid == -1) len = append_metric(len, max_len, "mag250_process_blocked{name=\"%s\"} 0\n", targets[i].name);
         }
 
+        set_state("Reading FD VFS");
         int hw_vid = 0, hw_aud = 0;
         if (stbapp_pid != -1) {
             char fd_dir_path[64];
@@ -243,14 +254,15 @@ void collector_loop() {
         len = append_metric(len, max_len, "mag250_hw_decoder_active{type=\"video\"} %d\n", hw_vid);
         len = append_metric(len, max_len, "mag250_hw_decoder_active{type=\"audio\"} %d\n", hw_aud);
 
+        set_state("Writing memory");
         write(fd, buffer, len);
         close(fd);
         rename(TEMP_FILE, METRICS_FILE);
         
-        sleep(5); 
+        set_state("Sleeping normally (5s)");
+        struct timeval slp = {5, 0}; select(0, NULL, NULL, NULL, &slp); // NTP-Proof sleep
     }
 }
-
 
 pid_t spawn_collector() {
     pid_t pid = fork();
@@ -261,7 +273,20 @@ pid_t spawn_collector() {
     return pid;
 }
 
-int main() {
+time_t get_file_mtime(const char* path) {
+    struct stat attr;
+    if (stat(path, &attr) == 0) return attr.st_mtime;
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            int timeout = atoi(argv[i+1]);
+            if (timeout > 0) expire_time = time(NULL) + timeout;
+        }
+    }
+
     signal(SIGPIPE, SIG_IGN);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -279,69 +304,128 @@ int main() {
     }
     listen(server_fd, 10);
 
-    // Запускаем сборщик в первый раз
     pid_t collector_pid = spawn_collector();
 
-    printf("Watchdog Exporter v%s started. Port: %d, Collector PID: %d\n", EXPORTER_VERSION, PORT, collector_pid);
+    int auto_restarts = 0;
+    time_t last_crash_time = 0;
+    char last_crash_reason[512] = "No crashes yet";
+
+    // Переменные для NTP-Proof Watchdog
+    time_t prev_mtime = 0;
+    int frozen_ticks = 0;
+
+    printf("Ironclad Exporter v%s started. Collector PID: %d\n", EXPORTER_VERSION, collector_pid);
     fflush(stdout);
 
     while (1) {
-        int status;
-        if (waitpid(collector_pid, &status, WNOHANG) != 0) {
-            // Если сборщик умер (например, убит системой при нехватке памяти)
-            printf("[WARNING] Collector died! Respawning...\n"); fflush(stdout);
+        int wstat;
+        while (waitpid(-1, &wstat, WNOHANG) > 0);
+
+        if (expire_time > 0 && time(NULL) >= expire_time) {
+            kill(collector_pid, SIGKILL);
+            unlink(METRICS_FILE); unlink(DEBUG_FILE);
+            exit(0);
+        }
+
+        int need_restart = 0;
+        const char* event_type = "";
+
+        if (kill(collector_pid, 0) == -1) {
+            need_restart = 1;
+            event_type = "Killed by OS or Crashed";
+        } else {
+            time_t current_mtime = get_file_mtime(METRICS_FILE);
+            if (current_mtime > 0) {
+                if (current_mtime == prev_mtime) {
+                    frozen_ticks++;
+                    if (frozen_ticks > 15) {
+                        need_restart = 1;
+                        event_type = "Frozen (Watchdog Triggered)";
+                        kill(collector_pid, SIGKILL);
+                    }
+                } else {
+                    frozen_ticks = 0;
+                    prev_mtime = current_mtime;
+                }
+            }
+        }
+
+        if (need_restart) {
+            auto_restarts++;
+            last_crash_time = time(NULL);
+            int dbg_fd = open(DEBUG_FILE, O_RDONLY);
+            if (dbg_fd >= 0) {
+                int r = read(dbg_fd, last_crash_reason, sizeof(last_crash_reason) - 1);
+                if (r > 0) last_crash_reason[r] = '\0';
+                else strcpy(last_crash_reason, "Unknown");
+                close(dbg_fd);
+            }
             collector_pid = spawn_collector();
+            frozen_ticks = 0;
         }
 
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(server_fd, &fds);
-        struct timeval tv = {2, 0}; // Просыпаемся каждые 2 секунды для проверки Watchdog
+        struct timeval tv = {2, 0}; 
 
         int sel = select(server_fd + 1, &fds, NULL, NULL, &tv);
-        if (sel <= 0) {
-            // если никто не подключился за 2 сек, или ошибка - просто идем на новый круг цикла
-            continue; 
-        }
+        if (sel <= 0) continue; 
 
         int client = accept(server_fd, NULL, NULL);
-        if (client < 0) {
-            // если не хватает файловых дескрипторов, спим 50мс и идем дальше.
-            usleep(50000); 
-            continue;
-        }
+        if (client < 0) { usleep(50000); continue; }
 
-        struct timeval net_tv = {2, 0};
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&net_tv, sizeof(net_tv));
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&net_tv, sizeof(net_tv));
+        int flags = fcntl(client, F_GETFL, 0);
+        fcntl(client, F_SETFL, flags | O_NONBLOCK);
 
-        char garbage[512];
-        if (read(client, garbage, sizeof(garbage)) <= 0) {
-            close(client);
-            continue;
-        }
+        char req[512] = {0};
+        read(client, req, sizeof(req)-1);
 
-        int fd = open(METRICS_FILE, O_RDONLY);
+        int is_debug = (strncmp(req, "GET /debug", 10) == 0);
+        int is_restart = (strncmp(req, "GET /restart", 12) == 0);
+        int is_quit = (strncmp(req, "GET /quit", 9) == 0);
+
         int len = 0;
-        if (fd >= 0) {
-            len = read(fd, buffer, sizeof(buffer) - 1);
-            close(fd);
+        if (is_restart) {
+            kill(collector_pid, SIGKILL);
+            collector_pid = spawn_collector();
+            frozen_ticks = 0;
+            len = sprintf(buffer, "Force restarted.\n");
+        } else if (is_quit) {
+            len = sprintf(buffer, "Shutting down.\n");
+        } else if (is_debug) {
+            len += snprintf(buffer + len, sizeof(buffer) - len, 
+                "=== WATCHDOG ===\nAuto-Restarts: %d\nLast Crash Time: %ld\nLast Crash State:\n%s\n\n=== CURRENT ===\n", 
+                auto_restarts, last_crash_time, last_crash_reason);
+            int fd = open(DEBUG_FILE, O_RDONLY);
+            if (fd >= 0) {
+                int r = read(fd, buffer + len, sizeof(buffer) - len - 1);
+                if (r > 0) len += r;
+                close(fd);
+            }
         } else {
-            len = sprintf(buffer, "# Metrics gathering...\n");
+            int fd = open(METRICS_FILE, O_RDONLY);
+            if (fd >= 0) { len = read(fd, buffer, sizeof(buffer) - 1); close(fd); }
+            else { len = sprintf(buffer, "# Gathering...\n"); }
+            if (len < 0) len = 0;
         }
-        if (len < 0) len = 0;
-        buffer[len] = 0;
 
+        buffer[len] = 0;
         char header[256];
         int hlen = snprintf(header, sizeof(header), 
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", 
-            len);
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len);
 
         write(client, header, hlen);
         write(client, buffer, len);
         
         shutdown(client, SHUT_RDWR);
         close(client);
+
+        if (is_quit) {
+            kill(collector_pid, SIGKILL);
+            unlink(METRICS_FILE); unlink(DEBUG_FILE);
+            exit(0);
+        }
     }
     return 0;
 }
