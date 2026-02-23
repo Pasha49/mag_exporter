@@ -16,7 +16,8 @@
 #define PORT 9100
 #define METRICS_FILE "/dev/shm/mag_metrics.prom"
 #define TEMP_FILE "/dev/shm/mag_metrics.tmp"
-#define EXPORTER_VERSION "1.18"
+#define PID_CACHE_FILE "/dev/shm/mag_pids.cache"
+#define EXPORTER_VERSION "1.23"
 
 static char buffer[32768]; 
 static char big_read_buf[4096]; 
@@ -28,6 +29,7 @@ typedef struct {
 
 TargetProcess targets[] = {
     {"MAG250_ControlT", -1},
+    {"stbapp", -1},
     {"AUD[0].PESTask", -1},
     {"AUD[0].DecTask", -1},
     {"AUD[0].MixTask", -1},
@@ -60,41 +62,80 @@ int append_metric(int len, int max_len, const char* format, ...) {
     return len;
 }
 
-void refresh_pids() {
-    DIR* dir = opendir("/proc");
-    if (!dir) return;
-
-    struct dirent* ent;
-    while ((ent = readdir(dir)) != NULL) {
-        if (isdigit(ent->d_name[0])) {
-            int pid = atoi(ent->d_name);
-            char path[64], cmd[256];
-            
-            snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-            if (read_file_to_buf(path, cmd, sizeof(cmd))) {
-                for (int i = 0; targets[i].name; i++) {
-                    if (targets[i].pid == -1 && strstr(cmd, targets[i].name)) targets[i].pid = pid;
+void load_or_refresh_pids() {
+    struct stat st;
+    int need_scan = 1;
+    
+    if (stat(PID_CACHE_FILE, &st) == 0 && (time(NULL) - st.st_mtime < 60)) {
+        int fd = open(PID_CACHE_FILE, O_RDONLY);
+        if (fd >= 0) {
+            char cache_buf[1024];
+            int n = read(fd, cache_buf, sizeof(cache_buf)-1);
+            close(fd);
+            if (n > 0) {
+                cache_buf[n] = '\0';
+                char* line = cache_buf;
+                while (line && *line) {
+                    char* next = strchr(line, '\n');
+                    if (next) *next = '\0';
+                    char t_name[64]; int t_pid;
+                    if (sscanf(line, "%63s %d", t_name, &t_pid) == 2) {
+                        for (int i = 0; targets[i].name; i++) {
+                            if (strcmp(targets[i].name, t_name) == 0) targets[i].pid = t_pid;
+                        }
+                    }
+                    line = next ? next + 1 : NULL;
                 }
+                need_scan = 0;
             }
-            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-            if (read_file_to_buf(path, cmd, sizeof(cmd))) {
-                char* op = strchr(cmd, '(');
-                char* cp = strrchr(cmd, ')');
-                if (op && cp) {
-                    *cp = 0;
-                    for (int i = 0; targets[i].name; i++) {
-                        if (targets[i].pid == -1 && strcmp(op + 1, targets[i].name) == 0) targets[i].pid = pid;
+        }
+    }
+
+    if (!need_scan) return;
+
+    DIR* dir = opendir("/proc");
+    if (dir) {
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (isdigit(ent->d_name[0])) {
+                int pid = atoi(ent->d_name);
+                char path[64], stat_buf[512];
+                
+                snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+                if (read_file_to_buf(path, stat_buf, sizeof(stat_buf))) {
+                    char* op = strchr(stat_buf, '(');
+                    char* cp = strrchr(stat_buf, ')');
+                    if (op && cp) {
+                        *cp = 0;
+                        for (int i = 0; targets[i].name; i++) {
+                            if (targets[i].pid == -1 && strcmp(op + 1, targets[i].name) == 0) {
+                                targets[i].pid = pid;
+                            }
+                        }
                     }
                 }
             }
         }
+        closedir(dir);
     }
-    closedir(dir);
+
+    int fd = open(PID_CACHE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char out[1024] = {0};
+        int off = 0;
+        for (int i = 0; targets[i].name; i++) {
+            off += snprintf(out+off, sizeof(out)-off, "%s %d\n", targets[i].name, targets[i].pid);
+        }
+        write(fd, out, off);
+        close(fd);
+    }
 }
 
 void collect_once() {
     int fd = open(TEMP_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) exit(1);
+
+    load_or_refresh_pids();
 
     int len = 0;
     int max_len = sizeof(buffer);
@@ -155,10 +196,7 @@ void collect_once() {
         len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
     }
 
-    int stbapp_pid = -1;
     for (int i = 0; targets[i].name; i++) {
-        if (strcmp(targets[i].name, "MAG250_ControlT") == 0) stbapp_pid = targets[i].pid;
-        
         if (targets[i].pid != -1) {
             char path[64];
             snprintf(path, sizeof(path), "/proc/%d/stat", targets[i].pid);
@@ -174,31 +212,35 @@ void collect_once() {
                             targets[i].name, ut, targets[i].name, st, targets[i].name, (state == 'D'));
                     }
                 }
+            } else {
+                targets[i].pid = -1;
             }
         }
         if (targets[i].pid == -1) len = append_metric(len, max_len, "mag250_process_blocked{name=\"%s\"} 0\n", targets[i].name);
     }
 
     int hw_vid = 0, hw_aud = 0;
-    if (stbapp_pid != -1) {
-        char fd_dir_path[64];
-        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", stbapp_pid);
-        DIR* fd_dir = opendir(fd_dir_path);
-        if (fd_dir) {
-            struct dirent* fd_ent;
-            while ((fd_ent = readdir(fd_dir)) != NULL) {
-                if (isdigit(fd_ent->d_name[0])) {
-                    char fd_path[128], link_target[256];
-                    snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir_path, fd_ent->d_name);
-                    int r = readlink(fd_path, link_target, sizeof(link_target)-1);
-                    if (r > 0) {
-                        link_target[r] = '\0';
-                        if (strstr(link_target, "stvid_ioctl")) hw_vid = 1;
-                        if (strstr(link_target, "staudlx_ioctl")) hw_aud = 1;
+    for (int i = 0; targets[i].name; i++) {
+        if (targets[i].pid != -1) {
+            char fd_dir_path[64];
+            snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", targets[i].pid);
+            DIR* fd_dir = opendir(fd_dir_path);
+            if (fd_dir) {
+                struct dirent* fd_ent;
+                while ((fd_ent = readdir(fd_dir)) != NULL) {
+                    if (isdigit(fd_ent->d_name[0])) {
+                        char fd_path[128], link_target[256];
+                        snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir_path, fd_ent->d_name);
+                        int r = readlink(fd_path, link_target, sizeof(link_target)-1);
+                        if (r > 0) {
+                            link_target[r] = '\0';
+                            if (strstr(link_target, "stvid_ioctl")) hw_vid = 1;
+                            if (strstr(link_target, "staudlx_ioctl")) hw_aud = 1;
+                        }
                     }
                 }
+                closedir(fd_dir);
             }
-            closedir(fd_dir);
         }
     }
     len = append_metric(len, max_len, "mag250_hw_decoder_active{type=\"video\"} %d\n", hw_vid);
@@ -220,6 +262,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    signal(SIGCHLD, SIG_DFL);
     signal(SIGPIPE, SIG_IGN);
 
     FILE *fp = popen("fw_printenv 2>/dev/null", "r");
@@ -244,11 +287,10 @@ int main(int argc, char *argv[]) {
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 1;
     listen(server_fd, 10);
 
-    printf("Stateless Exporter v%s started. Port: %d\n", EXPORTER_VERSION, PORT);
+    printf("Stable Exporter v%s started. Port: %d\n", EXPORTER_VERSION, PORT);
     fflush(stdout);
 
     time_t last_spawn = 0;
-    time_t last_pid_refresh = 0;
     pid_t active_child = 0;
 
     while (1) {
@@ -261,26 +303,20 @@ int main(int argc, char *argv[]) {
         time_t now = time(NULL);
 
         if (expire_time > 0 && now >= expire_time) {
-            unlink(METRICS_FILE);
+            unlink(METRICS_FILE); unlink(PID_CACHE_FILE);
             exit(0);
-        }
-
-        if (now - last_pid_refresh > 60 || now < last_pid_refresh) {
-            refresh_pids();
-            last_pid_refresh = now;
         }
 
         if (active_child == 0 && (now - last_spawn >= 5 || now < last_spawn)) {
             active_child = fork();
             if (active_child == 0) {
                 collect_once();
+            } else if (active_child > 0) {
+                last_spawn = now;
             }
-            last_spawn = now;
         }
         else if (active_child > 0 && (now - last_spawn > 5)) {
             kill(active_child, SIGKILL);
-            waitpid(active_child, &wstat, 0); // Добиваем
-            active_child = 0;
         }
 
         fd_set fds;
@@ -289,7 +325,7 @@ int main(int argc, char *argv[]) {
         struct timeval tv = {1, 0};
 
         int sel = select(server_fd + 1, &fds, NULL, NULL, &tv);
-        if (sel <= 0) continue; 
+        if (sel <= 0) continue;
 
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) { usleep(50000); continue; }
@@ -302,12 +338,17 @@ int main(int argc, char *argv[]) {
 
         int is_quit = (strncmp(req, "GET /quit", 9) == 0);
         int is_debug = (strncmp(req, "GET /debug", 10) == 0);
+        int is_restart = (strncmp(req, "GET /restart", 12) == 0);
 
         int len = 0;
         if (is_quit) {
             len = sprintf(buffer, "Shutting down.\n");
+        } else if (is_restart) {
+            if (active_child > 0) kill(active_child, SIGKILL);
+            unlink(PID_CACHE_FILE);
+            len = sprintf(buffer, "Force restarted collector cache.\n");
         } else if (is_debug) {
-            len = sprintf(buffer, "Stateless Architecture Active.\nChild PID: %d\nLast Spawn: %ld\n", active_child, last_spawn);
+            len = sprintf(buffer, "Version: %s\nActive Child PID: %d\nLast Spawn Time: %ld\n", EXPORTER_VERSION, active_child, last_spawn);
         } else {
             int fd = open(METRICS_FILE, O_RDONLY);
             if (fd >= 0) { len = read(fd, buffer, sizeof(buffer) - 1); close(fd); }
@@ -322,13 +363,13 @@ int main(int argc, char *argv[]) {
 
         write(client, header, hlen);
         write(client, buffer, len);
-        
+
         shutdown(client, SHUT_RDWR);
         close(client);
 
         if (is_quit) {
             if (active_child > 0) kill(active_child, SIGKILL);
-            unlink(METRICS_FILE);
+            unlink(METRICS_FILE); unlink(PID_CACHE_FILE);
             exit(0);
         }
     }
