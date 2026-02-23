@@ -17,7 +17,7 @@
 #define METRICS_FILE "/dev/shm/mag_metrics.prom"
 #define TEMP_FILE "/dev/shm/mag_metrics.tmp"
 #define PID_CACHE_FILE "/dev/shm/mag_pids.cache"
-#define EXPORTER_VERSION "1.23"
+#define EXPORTER_VERSION "1.24"
 
 static char buffer[32768]; 
 static char big_read_buf[4096]; 
@@ -28,8 +28,7 @@ typedef struct {
 } TargetProcess;
 
 TargetProcess targets[] = {
-    {"MAG250_ControlT", -1},
-    {"stbapp", -1},
+    {"PlayerApp", -1},
     {"AUD[0].PESTask", -1},
     {"AUD[0].DecTask", -1},
     {"AUD[0].MixTask", -1},
@@ -107,9 +106,18 @@ void load_or_refresh_pids() {
                     char* cp = strrchr(stat_buf, ')');
                     if (op && cp) {
                         *cp = 0;
+                        char* pname = op + 1; // Имя процесса
+                        
                         for (int i = 0; targets[i].name; i++) {
-                            if (targets[i].pid == -1 && strcmp(op + 1, targets[i].name) == 0) {
-                                targets[i].pid = pid;
+                            if (targets[i].pid == -1) {
+                                if (strcmp(targets[i].name, "PlayerApp") == 0) {
+                                    if (strstr(pname, "stbapp") || strstr(pname, "Control")) {
+                                        targets[i].pid = pid;
+                                    }
+                                } 
+                                else if (strcmp(pname, targets[i].name) == 0) {
+                                    targets[i].pid = pid;
+                                }
                             }
                         }
                     }
@@ -196,7 +204,10 @@ void collect_once() {
         len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
     }
 
+    int player_pid = -1;
     for (int i = 0; targets[i].name; i++) {
+        if (strcmp(targets[i].name, "PlayerApp") == 0) player_pid = targets[i].pid;
+        
         if (targets[i].pid != -1) {
             char path[64];
             snprintf(path, sizeof(path), "/proc/%d/stat", targets[i].pid);
@@ -213,34 +224,32 @@ void collect_once() {
                     }
                 }
             } else {
-                targets[i].pid = -1;
+                targets[i].pid = -1; // Процесс умер
             }
         }
         if (targets[i].pid == -1) len = append_metric(len, max_len, "mag250_process_blocked{name=\"%s\"} 0\n", targets[i].name);
     }
 
     int hw_vid = 0, hw_aud = 0;
-    for (int i = 0; targets[i].name; i++) {
-        if (targets[i].pid != -1) {
-            char fd_dir_path[64];
-            snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", targets[i].pid);
-            DIR* fd_dir = opendir(fd_dir_path);
-            if (fd_dir) {
-                struct dirent* fd_ent;
-                while ((fd_ent = readdir(fd_dir)) != NULL) {
-                    if (isdigit(fd_ent->d_name[0])) {
-                        char fd_path[128], link_target[256];
-                        snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir_path, fd_ent->d_name);
-                        int r = readlink(fd_path, link_target, sizeof(link_target)-1);
-                        if (r > 0) {
-                            link_target[r] = '\0';
-                            if (strstr(link_target, "stvid_ioctl")) hw_vid = 1;
-                            if (strstr(link_target, "staudlx_ioctl")) hw_aud = 1;
-                        }
+    if (player_pid != -1) {
+        char fd_dir_path[64];
+        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", player_pid);
+        DIR* fd_dir = opendir(fd_dir_path);
+        if (fd_dir) {
+            struct dirent* fd_ent;
+            while ((fd_ent = readdir(fd_dir)) != NULL) {
+                if (isdigit(fd_ent->d_name[0])) {
+                    char fd_path[128], link_target[256];
+                    snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir_path, fd_ent->d_name);
+                    int r = readlink(fd_path, link_target, sizeof(link_target)-1);
+                    if (r > 0) {
+                        link_target[r] = '\0';
+                        if (strstr(link_target, "stvid_ioctl")) hw_vid = 1;
+                        if (strstr(link_target, "staudlx_ioctl")) hw_aud = 1;
                     }
                 }
-                closedir(fd_dir);
             }
+            closedir(fd_dir);
         }
     }
     len = append_metric(len, max_len, "mag250_hw_decoder_active{type=\"video\"} %d\n", hw_vid);
@@ -250,7 +259,7 @@ void collect_once() {
     close(fd);
     rename(TEMP_FILE, METRICS_FILE);
 
-    exit(0);
+    exit(0); 
 }
 
 int main(int argc, char *argv[]) {
@@ -287,7 +296,7 @@ int main(int argc, char *argv[]) {
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 1;
     listen(server_fd, 10);
 
-    printf("Stable Exporter v%s started. Port: %d\n", EXPORTER_VERSION, PORT);
+    printf("Smart Exporter v%s started. Port: %d\n", EXPORTER_VERSION, PORT);
     fflush(stdout);
 
     time_t last_spawn = 0;
@@ -314,7 +323,7 @@ int main(int argc, char *argv[]) {
             } else if (active_child > 0) {
                 last_spawn = now;
             }
-        }
+        } 
         else if (active_child > 0 && (now - last_spawn > 5)) {
             kill(active_child, SIGKILL);
         }
@@ -322,10 +331,10 @@ int main(int argc, char *argv[]) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(server_fd, &fds);
-        struct timeval tv = {1, 0};
+        struct timeval tv = {1, 0}; 
 
         int sel = select(server_fd + 1, &fds, NULL, NULL, &tv);
-        if (sel <= 0) continue;
+        if (sel <= 0) continue; 
 
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) { usleep(50000); continue; }
@@ -363,7 +372,7 @@ int main(int argc, char *argv[]) {
 
         write(client, header, hlen);
         write(client, buffer, len);
-
+        
         shutdown(client, SHUT_RDWR);
         close(client);
 
