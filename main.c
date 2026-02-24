@@ -17,26 +17,21 @@
 #define METRICS_FILE "/dev/shm/mag_metrics.prom"
 #define TEMP_FILE "/dev/shm/mag_metrics.tmp"
 #define PID_CACHE_FILE "/dev/shm/mag_pids.cache"
-#define EXPORTER_VERSION "1.24"
+#define EXPORTER_VERSION "1.29"
 
-static char buffer[32768]; 
-static char big_read_buf[4096]; 
+static char buffer[32768];
+static char big_read_buf[4096];
+
+#define MAX_DYN_PROCS 50
 
 typedef struct {
-    const char* name;
+    char name[32];
     int pid;
-} TargetProcess;
+} DynamicProcess;
 
-TargetProcess targets[] = {
-    {"PlayerApp", -1},
-    {"AUD[0].PESTask", -1},
-    {"AUD[0].DecTask", -1},
-    {"AUD[0].MixTask", -1},
-    {"STVID[0].H264Pa", -1},
-    {"STVID[0].Produc", -1},
-    {"STVID[0].Displa", -1},
-    {NULL, -1}
-};
+DynamicProcess dyn_procs[MAX_DYN_PROCS];
+int dyn_procs_count = 0;
+int player_pid = -1;
 
 char global_fw_desc[128] = "unknown";
 char global_mac_addr[32] = "unknown";
@@ -61,36 +56,58 @@ int append_metric(int len, int max_len, const char* format, ...) {
     return len;
 }
 
-void load_or_refresh_pids() {
+void load_or_refresh_dynamic_pids() {
     struct stat st;
     int need_scan = 1;
     
+    dyn_procs_count = 0;
+    player_pid = -1;
+
     if (stat(PID_CACHE_FILE, &st) == 0 && (time(NULL) - st.st_mtime < 60)) {
         int fd = open(PID_CACHE_FILE, O_RDONLY);
         if (fd >= 0) {
-            char cache_buf[1024];
+            char cache_buf[2048];
             int n = read(fd, cache_buf, sizeof(cache_buf)-1);
             close(fd);
             if (n > 0) {
                 cache_buf[n] = '\0';
                 char* line = cache_buf;
+                int all_alive = 1;
+                
                 while (line && *line) {
                     char* next = strchr(line, '\n');
                     if (next) *next = '\0';
+                    
                     char t_name[64]; int t_pid;
                     if (sscanf(line, "%63s %d", t_name, &t_pid) == 2) {
-                        for (int i = 0; targets[i].name; i++) {
-                            if (strcmp(targets[i].name, t_name) == 0) targets[i].pid = t_pid;
+                        char stat_path[64];
+                        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", t_pid);
+                        int sfd = open(stat_path, O_RDONLY | O_NONBLOCK);
+                        if (sfd < 0) {
+                            all_alive = 0; 
+                            break;
+                        }
+                        close(sfd);
+
+                        if (strcmp(t_name, "PlayerApp") == 0) player_pid = t_pid;
+
+                        if (dyn_procs_count < MAX_DYN_PROCS) {
+                            strncpy(dyn_procs[dyn_procs_count].name, t_name, 31);
+                            dyn_procs[dyn_procs_count].pid = t_pid;
+                            dyn_procs_count++;
                         }
                     }
                     line = next ? next + 1 : NULL;
                 }
-                need_scan = 0;
+                if (all_alive && player_pid != -1) need_scan = 0;
             }
         }
     }
 
     if (!need_scan) return;
+
+    dyn_procs_count = 0;
+    player_pid = -1;
 
     DIR* dir = opendir("/proc");
     if (dir) {
@@ -106,18 +123,29 @@ void load_or_refresh_pids() {
                     char* cp = strrchr(stat_buf, ')');
                     if (op && cp) {
                         *cp = 0;
-                        char* pname = op + 1; // Имя процесса
+                        char* pname = op + 1;
                         
-                        for (int i = 0; targets[i].name; i++) {
-                            if (targets[i].pid == -1) {
-                                if (strcmp(targets[i].name, "PlayerApp") == 0) {
-                                    if (strstr(pname, "stbapp") || strstr(pname, "Control")) {
-                                        targets[i].pid = pid;
+                        if (player_pid == -1 && (strstr(pname, "ControlT") || strstr(pname, "stbapp"))) {
+                            player_pid = pid;
+                            if (dyn_procs_count < MAX_DYN_PROCS) {
+                                strcpy(dyn_procs[dyn_procs_count].name, "PlayerApp");
+                                dyn_procs[dyn_procs_count].pid = pid;
+                                dyn_procs_count++;
+                            }
+                        }
+                        else if (strncmp(pname, "AUD", 3) == 0 || strncmp(pname, "STVID", 5) == 0) {
+                            if (dyn_procs_count < MAX_DYN_PROCS) {
+                                char safe_name[32];
+                                int j = 0;
+                                for (int i = 0; pname[i] != '\0' && i < 31; i++) {
+                                    if (isalnum(pname[i]) || pname[i] == '_' || pname[i] == '[' || pname[i] == ']' || pname[i] == '.') {
+                                        safe_name[j++] = pname[i];
                                     }
-                                } 
-                                else if (strcmp(pname, targets[i].name) == 0) {
-                                    targets[i].pid = pid;
                                 }
+                                safe_name[j] = '\0';
+                                strncpy(dyn_procs[dyn_procs_count].name, safe_name, 31);
+                                dyn_procs[dyn_procs_count].pid = pid;
+                                dyn_procs_count++;
                             }
                         }
                     }
@@ -129,10 +157,10 @@ void load_or_refresh_pids() {
 
     int fd = open(PID_CACHE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-        char out[1024] = {0};
+        char out[2048] = {0};
         int off = 0;
-        for (int i = 0; targets[i].name; i++) {
-            off += snprintf(out+off, sizeof(out)-off, "%s %d\n", targets[i].name, targets[i].pid);
+        for (int i = 0; i < dyn_procs_count; i++) {
+            off += snprintf(out+off, sizeof(out)-off, "%s %d\n", dyn_procs[i].name, dyn_procs[i].pid);
         }
         write(fd, out, off);
         close(fd);
@@ -143,12 +171,19 @@ void collect_once() {
     int fd = open(TEMP_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) exit(1);
 
-    load_or_refresh_pids();
+    load_or_refresh_dynamic_pids();
 
     int len = 0;
     int max_len = sizeof(buffer);
 
-    len = append_metric(len, max_len, "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\"} 1\n", EXPORTER_VERSION, global_fw_desc, global_mac_addr);
+    char video_codec[16] = "none";
+    for (int i = 0; i < dyn_procs_count; i++) {
+        if (strstr(dyn_procs[i].name, "H264")) strcpy(video_codec, "h264");
+        else if (strstr(dyn_procs[i].name, "MPEG2")) strcpy(video_codec, "mpeg2");
+    }
+
+    len = append_metric(len, max_len, "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\",codec=\"%s\"} 1\n", 
+        EXPORTER_VERSION, global_fw_desc, global_mac_addr, video_codec);
 
     if (read_file_to_buf("/proc/uptime", big_read_buf, sizeof(big_read_buf))) {
         double up; if(sscanf(big_read_buf, "%lf", &up)) len = append_metric(len, max_len, "node_uptime_seconds %.2f\n", up);
@@ -204,30 +239,25 @@ void collect_once() {
         len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
     }
 
-    int player_pid = -1;
-    for (int i = 0; targets[i].name; i++) {
-        if (strcmp(targets[i].name, "PlayerApp") == 0) player_pid = targets[i].pid;
+    for (int i = 0; i < dyn_procs_count; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/stat", dyn_procs[i].pid);
         
-        if (targets[i].pid != -1) {
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/%d/stat", targets[i].pid);
-            if (read_file_to_buf(path, big_read_buf, sizeof(big_read_buf))) {
-                char* cp = strrchr(big_read_buf, ')');
-                if (cp) {
-                    char state; unsigned long ut, st;
-                    if (sscanf(cp + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &state, &ut, &st) >= 3) {
-                        len = append_metric(len, max_len, 
-                            "mag250_process_cpu_ticks{name=\"%s\",mode=\"user\"} %lu\n"
-                            "mag250_process_cpu_ticks{name=\"%s\",mode=\"system\"} %lu\n"
-                            "mag250_process_blocked{name=\"%s\"} %d\n", 
-                            targets[i].name, ut, targets[i].name, st, targets[i].name, (state == 'D'));
-                    }
+        if (read_file_to_buf(path, big_read_buf, sizeof(big_read_buf))) {
+            char* cp = strrchr(big_read_buf, ')');
+            if (cp) {
+                char state; unsigned long ut, st;
+                if (sscanf(cp + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &state, &ut, &st) >= 3) {
+                    len = append_metric(len, max_len, 
+                        "mag250_process_cpu_ticks{name=\"%s\",mode=\"user\"} %lu\n"
+                        "mag250_process_cpu_ticks{name=\"%s\",mode=\"system\"} %lu\n"
+                        "mag250_process_blocked{name=\"%s\"} %d\n", 
+                        dyn_procs[i].name, ut, dyn_procs[i].name, st, dyn_procs[i].name, (state == 'D'));
                 }
-            } else {
-                targets[i].pid = -1; // Процесс умер
             }
+        } else {
+            len = append_metric(len, max_len, "mag250_process_blocked{name=\"%s\"} 0\n", dyn_procs[i].name);
         }
-        if (targets[i].pid == -1) len = append_metric(len, max_len, "mag250_process_blocked{name=\"%s\"} 0\n", targets[i].name);
     }
 
     int hw_vid = 0, hw_aud = 0;
@@ -296,7 +326,7 @@ int main(int argc, char *argv[]) {
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 1;
     listen(server_fd, 10);
 
-    printf("Smart Exporter v%s started. Port: %d\n", EXPORTER_VERSION, PORT);
+    printf("Exporter v%s started. Port: %d\n", EXPORTER_VERSION, PORT);
     fflush(stdout);
 
     time_t last_spawn = 0;
@@ -339,11 +369,15 @@ int main(int argc, char *argv[]) {
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) { usleep(50000); continue; }
 
-        int flags = fcntl(client, F_GETFL, 0);
-        fcntl(client, F_SETFL, flags | O_NONBLOCK);
+        struct timeval net_tv = {2, 0};
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&net_tv, sizeof(net_tv));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&net_tv, sizeof(net_tv));
 
         char req[512] = {0};
-        read(client, req, sizeof(req)-1);
+        if (read(client, req, sizeof(req)-1) <= 0) {
+            close(client);
+            continue;
+        }
 
         int is_quit = (strncmp(req, "GET /quit", 9) == 0);
         int is_debug = (strncmp(req, "GET /debug", 10) == 0);
@@ -354,6 +388,7 @@ int main(int argc, char *argv[]) {
             len = sprintf(buffer, "Shutting down.\n");
         } else if (is_restart) {
             if (active_child > 0) kill(active_child, SIGKILL);
+            active_child = 0;
             unlink(PID_CACHE_FILE);
             len = sprintf(buffer, "Force restarted collector cache.\n");
         } else if (is_debug) {
@@ -373,8 +408,7 @@ int main(int argc, char *argv[]) {
         write(client, header, hlen);
         write(client, buffer, len);
         
-        shutdown(client, SHUT_RDWR);
-        close(client);
+        close(client); // Graceful close для Prometheus
 
         if (is_quit) {
             if (active_child > 0) kill(active_child, SIGKILL);
