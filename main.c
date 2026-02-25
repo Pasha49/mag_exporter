@@ -17,7 +17,7 @@
 #define METRICS_FILE "/dev/shm/mag_metrics.prom"
 #define TEMP_FILE "/dev/shm/mag_metrics.tmp"
 #define PID_CACHE_FILE "/dev/shm/mag_pids.cache"
-#define EXPORTER_VERSION "1.29"
+#define EXPORTER_VERSION "1.30"
 
 static char buffer[32768];
 static char big_read_buf[4096];
@@ -59,7 +59,7 @@ int append_metric(int len, int max_len, const char* format, ...) {
 void load_or_refresh_dynamic_pids() {
     struct stat st;
     int need_scan = 1;
-    
+
     dyn_procs_count = 0;
     player_pid = -1;
 
@@ -73,18 +73,18 @@ void load_or_refresh_dynamic_pids() {
                 cache_buf[n] = '\0';
                 char* line = cache_buf;
                 int all_alive = 1;
-                
+
                 while (line && *line) {
                     char* next = strchr(line, '\n');
                     if (next) *next = '\0';
-                    
+
                     char t_name[64]; int t_pid;
                     if (sscanf(line, "%63s %d", t_name, &t_pid) == 2) {
                         char stat_path[64];
                         snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", t_pid);
                         int sfd = open(stat_path, O_RDONLY | O_NONBLOCK);
                         if (sfd < 0) {
-                            all_alive = 0; 
+                            all_alive = 0;
                             break;
                         }
                         close(sfd);
@@ -116,7 +116,7 @@ void load_or_refresh_dynamic_pids() {
             if (isdigit(ent->d_name[0])) {
                 int pid = atoi(ent->d_name);
                 char path[64], stat_buf[512];
-                
+
                 snprintf(path, sizeof(path), "/proc/%d/stat", pid);
                 if (read_file_to_buf(path, stat_buf, sizeof(stat_buf))) {
                     char* op = strchr(stat_buf, '(');
@@ -124,7 +124,7 @@ void load_or_refresh_dynamic_pids() {
                     if (op && cp) {
                         *cp = 0;
                         char* pname = op + 1;
-                        
+
                         if (player_pid == -1 && (strstr(pname, "ControlT") || strstr(pname, "stbapp"))) {
                             player_pid = pid;
                             if (dyn_procs_count < MAX_DYN_PROCS) {
@@ -176,14 +176,48 @@ void collect_once() {
     int len = 0;
     int max_len = sizeof(buffer);
 
+    int total_procs = 0;
+    DIR* p_dir = opendir("/proc");
+    if (p_dir) {
+        struct dirent* e;
+        while ((e = readdir(p_dir)) != NULL) {
+            if (isdigit(e->d_name[0])) total_procs++;
+        }
+        closedir(p_dir);
+    }
+
+    // read /proc/net/udp and IP
+    int udp_cnt = 0;
+    char current_udp_ip[32] = "none";
+    if (read_file_to_buf("/proc/net/udp", big_read_buf, sizeof(big_read_buf))) {
+        char* p = big_read_buf;
+        while ((p = strchr(p, '\n')) != NULL) {
+            p++; unsigned int addr;
+            // IP from HEX)
+            if (sscanf(p, "%*d: %x:", &addr) == 1) {
+                unsigned char b1 = (addr) & 0xFF;
+                unsigned char b2 = (addr >> 8) & 0xFF;
+                unsigned char b3 = (addr >> 16) & 0xFF;
+                unsigned char b4 = (addr >> 24) & 0xFF;
+                if (b1 >= 0xE0 && b1 <= 0xEF) { // 224.0.0.0 - 239.255.255.255
+                    udp_cnt++;
+                    snprintf(current_udp_ip, sizeof(current_udp_ip), "%d.%d.%d.%d", b1, b2, b3, b4);
+                }
+            }
+        }
+    }
+
+    // codec
     char video_codec[16] = "none";
     for (int i = 0; i < dyn_procs_count; i++) {
         if (strstr(dyn_procs[i].name, "H264")) strcpy(video_codec, "h264");
         else if (strstr(dyn_procs[i].name, "MPEG2")) strcpy(video_codec, "mpeg2");
     }
 
-    len = append_metric(len, max_len, "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\",codec=\"%s\"} 1\n", 
-        EXPORTER_VERSION, global_fw_desc, global_mac_addr, video_codec);
+    len = append_metric(len, max_len, "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\",codec=\"%s\",udp_addr=\"%s\"} 1\n", 
+        EXPORTER_VERSION, global_fw_desc, global_mac_addr, video_codec, current_udp_ip);
+
+    len = append_metric(len, max_len, "node_procs_total %d\n", total_procs);
 
     if (read_file_to_buf("/proc/uptime", big_read_buf, sizeof(big_read_buf))) {
         double up; if(sscanf(big_read_buf, "%lf", &up)) len = append_metric(len, max_len, "node_uptime_seconds %.2f\n", up);
@@ -229,20 +263,13 @@ void collect_once() {
         }
     }
 
-    if (read_file_to_buf("/proc/net/udp", big_read_buf, sizeof(big_read_buf))) {
-        int udp_cnt = 0;
-        char* p = big_read_buf;
-        while ((p = strchr(p, '\n')) != NULL) {
-            p++; unsigned int addr;
-            if (sscanf(p, "%*d: %x:", &addr) == 1 && ((unsigned char)(addr & 0xFF) >= 0xE0)) udp_cnt++;
-        }
-        len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
-    }
+    // streams
+    len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
 
     for (int i = 0; i < dyn_procs_count; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/%d/stat", dyn_procs[i].pid);
-        
+
         if (read_file_to_buf(path, big_read_buf, sizeof(big_read_buf))) {
             char* cp = strrchr(big_read_buf, ')');
             if (cp) {
@@ -289,9 +316,10 @@ void collect_once() {
     close(fd);
     rename(TEMP_FILE, METRICS_FILE);
 
-    exit(0); 
+    exit(0);
 }
 
+// main process
 int main(int argc, char *argv[]) {
     time_t expire_time = 0;
     for (int i = 1; i < argc; i++) {
@@ -353,7 +381,7 @@ int main(int argc, char *argv[]) {
             } else if (active_child > 0) {
                 last_spawn = now;
             }
-        } 
+        }
         else if (active_child > 0 && (now - last_spawn > 5)) {
             kill(active_child, SIGKILL);
         }
@@ -361,10 +389,10 @@ int main(int argc, char *argv[]) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(server_fd, &fds);
-        struct timeval tv = {1, 0}; 
+        struct timeval tv = {1, 0};
 
         int sel = select(server_fd + 1, &fds, NULL, NULL, &tv);
-        if (sel <= 0) continue; 
+        if (sel <= 0) continue;
 
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) { usleep(50000); continue; }
@@ -407,8 +435,8 @@ int main(int argc, char *argv[]) {
 
         write(client, header, hlen);
         write(client, buffer, len);
-        
-        close(client); // Graceful close для Prometheus
+
+        close(client);
 
         if (is_quit) {
             if (active_child > 0) kill(active_child, SIGKILL);
