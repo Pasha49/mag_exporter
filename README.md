@@ -14,8 +14,9 @@ sudo docker run --rm -v "$PWD":/usr/src/app mag-c-builder sh4-linux-gcc -O3 -sta
 ```
 ## Metrics
 ```json
-mag250_device_info{version="1.30",fw_desc="Firmware_name_mag250_218r18.1",mac="00:1a:79:11:22:33",codec="mpeg2",udp_addr="239.0.2.104"} 1
+mag250_device_info{version="1.31",fw_desc="Firmware_name_mag250_218r18.1",mac="00:1a:79:11:22:33",codec="mpeg2",udp_addr="239.0.2.104"} 1
 node_procs_total 97
+node_temperature_celsius 75.00
 node_uptime_seconds 512425.79
 mag_exporter_last_update_timestamp 947197225
 node_load1 20.80

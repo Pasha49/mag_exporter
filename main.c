@@ -17,7 +17,7 @@
 #define METRICS_FILE "/dev/shm/mag_metrics.prom"
 #define TEMP_FILE "/dev/shm/mag_metrics.tmp"
 #define PID_CACHE_FILE "/dev/shm/mag_pids.cache"
-#define EXPORTER_VERSION "1.30"
+#define EXPORTER_VERSION "1.31"
 
 static char buffer[32768];
 static char big_read_buf[4096];
@@ -27,9 +27,9 @@ static char big_read_buf[4096];
 typedef struct {
     char name[32];
     int pid;
-} DynamicProcess;
+} TargetProcess;
 
-DynamicProcess dyn_procs[MAX_DYN_PROCS];
+TargetProcess dyn_procs[MAX_DYN_PROCS];
 int dyn_procs_count = 0;
 int player_pid = -1;
 
@@ -186,20 +186,18 @@ void collect_once() {
         closedir(p_dir);
     }
 
-    // read /proc/net/udp and IP
     int udp_cnt = 0;
     char current_udp_ip[32] = "none";
     if (read_file_to_buf("/proc/net/udp", big_read_buf, sizeof(big_read_buf))) {
         char* p = big_read_buf;
         while ((p = strchr(p, '\n')) != NULL) {
             p++; unsigned int addr;
-            // IP from HEX)
             if (sscanf(p, "%*d: %x:", &addr) == 1) {
                 unsigned char b1 = (addr) & 0xFF;
                 unsigned char b2 = (addr >> 8) & 0xFF;
                 unsigned char b3 = (addr >> 16) & 0xFF;
                 unsigned char b4 = (addr >> 24) & 0xFF;
-                if (b1 >= 0xE0 && b1 <= 0xEF) { // 224.0.0.0 - 239.255.255.255
+                if (b1 >= 0xE0 && b1 <= 0xEF) {
                     udp_cnt++;
                     snprintf(current_udp_ip, sizeof(current_udp_ip), "%d.%d.%d.%d", b1, b2, b3, b4);
                 }
@@ -207,7 +205,6 @@ void collect_once() {
         }
     }
 
-    // codec
     char video_codec[16] = "none";
     for (int i = 0; i < dyn_procs_count; i++) {
         if (strstr(dyn_procs[i].name, "H264")) strcpy(video_codec, "h264");
@@ -216,8 +213,16 @@ void collect_once() {
 
     len = append_metric(len, max_len, "mag250_device_info{version=\"%s\",fw_desc=\"%s\",mac=\"%s\",codec=\"%s\",udp_addr=\"%s\"} 1\n", 
         EXPORTER_VERSION, global_fw_desc, global_mac_addr, video_codec, current_udp_ip);
-
+    
     len = append_metric(len, max_len, "node_procs_total %d\n", total_procs);
+
+    if (read_file_to_buf("/sys/class/thermal/thermal_zone0/temp", big_read_buf, sizeof(big_read_buf))) {
+        long temp_milli = atol(big_read_buf);
+        if (temp_milli > 0) {
+            double temp_celsius = (double)temp_milli / 1000.0;
+            len = append_metric(len, max_len, "node_temperature_celsius %.2f\n", temp_celsius);
+        }
+    }
 
     if (read_file_to_buf("/proc/uptime", big_read_buf, sizeof(big_read_buf))) {
         double up; if(sscanf(big_read_buf, "%lf", &up)) len = append_metric(len, max_len, "node_uptime_seconds %.2f\n", up);
@@ -263,7 +268,6 @@ void collect_once() {
         }
     }
 
-    // streams
     len = append_metric(len, max_len, "mag250_udp_streams_total %d\n", udp_cnt);
 
     for (int i = 0; i < dyn_procs_count; i++) {
@@ -319,7 +323,6 @@ void collect_once() {
     exit(0);
 }
 
-// main process
 int main(int argc, char *argv[]) {
     time_t expire_time = 0;
     for (int i = 1; i < argc; i++) {
@@ -381,7 +384,7 @@ int main(int argc, char *argv[]) {
             } else if (active_child > 0) {
                 last_spawn = now;
             }
-        }
+        } 
         else if (active_child > 0 && (now - last_spawn > 5)) {
             kill(active_child, SIGKILL);
         }
@@ -435,7 +438,7 @@ int main(int argc, char *argv[]) {
 
         write(client, header, hlen);
         write(client, buffer, len);
-
+ 
         close(client);
 
         if (is_quit) {
